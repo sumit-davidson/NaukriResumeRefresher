@@ -1,0 +1,8 @@
+﻿
+*.log
+bin/
+obj/
+node_modules/
+
+secrets/*
+!secrets/keep-this.txt
