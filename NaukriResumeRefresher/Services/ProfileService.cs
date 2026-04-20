@@ -207,6 +207,8 @@ namespace NaukriResumeRefresher.Services
             //    ("Web API, MVC",                            "Web API,MVC"),
             //};
 
+
+
             var applicable = _settings.SummarySwaps
                 .Where(s => original.Contains(s.From))
                 .OrderBy(_ => rng.Next())
