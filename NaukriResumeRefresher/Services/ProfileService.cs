@@ -208,8 +208,7 @@ namespace NaukriResumeRefresher.Services
             //};
 
 
-
-            var applicabl = _settings.SummarySwaps
+            var applicable = _settings.SummarySwaps
                 .Where(s => original.Contains(s.From))
                 .OrderBy(_ => rng.Next())
                 .Take(rng.Next(1, 3))
