@@ -209,7 +209,7 @@ namespace NaukriResumeRefresher.Services
 
 
 
-            var applicable = _settings.SummarySwaps
+            var applicabl = _settings.SummarySwaps
                 .Where(s => original.Contains(s.From))
                 .OrderBy(_ => rng.Next())
                 .Take(rng.Next(1, 3))
