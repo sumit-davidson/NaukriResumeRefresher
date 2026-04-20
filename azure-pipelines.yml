@@ -4,6 +4,10 @@ trigger:
 pool:
   name: my-laptop
 
+variables:
+  imageTag: $(Build.BuildId)
+  imageName: naukri-refresher
+
 steps:
   - task: UseDotNet@2
     displayName: 'Install .NET SDK'
@@ -20,8 +24,19 @@ steps:
   - script: dotnet publish --configuration Release --output $(Build.ArtifactStagingDirectory)
     displayName: 'Publish Project'
 
-  - task: PublishBuildArtifacts@1
-    displayName: 'Upload Build Artifacts'
+  - task: Docker@2
+    displayName: 'Build Docker Image'
     inputs:
-      PathtoPublish: '$(Build.ArtifactStagingDirectory)'
-      ArtifactName: 'naukri-refresher'
+      command: build
+      dockerfile: Dockerfile
+      containerRegistry: acr-connection
+      repository: naukri-refresher
+      tags: $(imageTag)
+
+  - task: Docker@2
+    displayName: 'Push Docker Image to ACR'
+    inputs:
+      command: push
+      containerRegistry: acr-connection
+      repository: naukri-refresher
+      tags: $(imageTag)
