@@ -1,0 +1,682 @@
+﻿using Microsoft.Extensions.Configuration;
+using Newtonsoft.Json;
+using Serilog;
+using System.Net;
+using System.Net.Http.Headers;
+using System.Text;
+using System.Text.Json;
+
+namespace NaukriResumeRefresher.Services
+{
+    public class AuthService
+    {
+        public async Task<(HttpClient client, string token)> LoginAsync(string email, string password)
+        {
+            Log.Information("Starting login process...");
+
+            var handler = new HttpClientHandler
+            {
+                UseCookies = true,
+                CookieContainer = new CookieContainer()
+            };
+
+            var client = new HttpClient(handler);
+
+            // ── Core Naukri headers ──────────────────────────────
+            client.DefaultRequestHeaders.Add("appid", "105");
+            client.DefaultRequestHeaders.Add("clientid", "d3skt0p");
+            client.DefaultRequestHeaders.Add("systemid", "jobseeker");
+            client.DefaultRequestHeaders.Add("x-requested-with", "XMLHttpRequest");
+
+            // ── Browser fingerprint headers (Akamai bot detection) ──
+            // These mimic a real Chrome 147 browser on Windows
+            // Without these, Akamai may flag the request as a bot
+            client.DefaultRequestHeaders.TryAddWithoutValidation("User-Agent",
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/147.0.0.0 Safari/537.36");
+            client.DefaultRequestHeaders.Add("Accept",
+                "application/json, text/plain, */*");
+            client.DefaultRequestHeaders.Add("Accept-Language",
+                "en-US,en;q=0.8");
+            client.DefaultRequestHeaders.TryAddWithoutValidation("sec-ch-ua",
+                "\"Brave\";v=\"147\", \"Not.A/Brand\";v=\"8\", \"Chromium\";v=\"147\"");
+            client.DefaultRequestHeaders.Add("sec-ch-ua-mobile", "?0");
+            client.DefaultRequestHeaders.Add("sec-ch-ua-platform", "\"Windows\"");
+            client.DefaultRequestHeaders.Add("sec-fetch-dest", "empty");
+            client.DefaultRequestHeaders.Add("sec-fetch-mode", "cors");
+            client.DefaultRequestHeaders.Add("sec-fetch-site", "same-origin");
+            client.DefaultRequestHeaders.Add("sec-gpc", "1");
+            client.DefaultRequestHeaders.Add("Origin", "https://www.naukri.com");
+            client.DefaultRequestHeaders.Add("Referer", "https://www.naukri.com/");
+
+            var payload = new { username = email, password = password };
+
+            try
+            {
+                Log.Information("Sending login request...");
+
+                var response = await client.PostAsync(
+                    "https://www.naukri.com/central-login-services/v1/login",
+                    new StringContent(System.Text.Json.JsonSerializer.Serialize(payload), Encoding.UTF8, "application/json")
+                );
+
+                Log.Information("Login response received. StatusCode: {StatusCode}", response.StatusCode);
+
+                if (!response.IsSuccessStatusCode)
+                {
+                    var errorBody = await response.Content.ReadAsStringAsync();
+                    Log.Error("Login failed. Status: {StatusCode}, Body: {Body}",
+                        response.StatusCode, errorBody);
+                    throw new Exception("Login failed");
+                }
+
+                // Extract Bearer token from nauk_at cookie
+                Log.Information("Login successful, extracting token...");
+                var cookies = handler.CookieContainer.GetCookies(new Uri("https://www.naukri.com"));
+                var token = cookies["nauk_at"]?.Value;
+
+                if (string.IsNullOrEmpty(token))
+                {
+                    Log.Error("Token extraction failed. 'nauk_at' cookie not found.");
+                    throw new Exception("Token missing");
+                }
+
+                // Log all cookies for debugging (first 20 chars only for security)
+                Log.Information("Cookies received after login:");
+                foreach (Cookie cookie in cookies)
+                {
+                    var preview = cookie.Value?.Length > 20
+                        ? cookie.Value.Substring(0, 20) + "..."
+                        : cookie.Value;
+                    Log.Information("  {Name} = {Value}", cookie.Name, preview);
+                }
+
+                // Set Bearer token for all future requests
+                client.DefaultRequestHeaders.Authorization =
+                    new AuthenticationHeaderValue("Bearer", token);
+
+                Log.Information("Token acquired and set successfully ✅");
+
+                return (client, token);
+            }
+            catch (Exception ex)
+            {
+                Log.Error(ex, "Exception occurred during login process");
+                throw;
+            }
+        }
+    }
+    public class NaukriService
+    {
+        // ─────────────────────────────────────────────
+        //  ENTRY POINT
+        // ─────────────────────────────────────────────
+        public async Task RunAsync()
+        {
+            Log.Information("========================================");
+            Log.Information("       NAUKRI AUTO REFRESHER STARTED    ");
+            Log.Information("========================================");
+
+            try
+            {
+                // 1. Load config
+                var config = new ConfigurationBuilder()
+                               .AddJsonFile("appsettings.json")
+                               .AddEnvironmentVariables()
+                               .Build();
+                Log.Information("[STEP 1/7] Configuration loaded");
+
+                var email = config["NaukriSettings:Email"];
+                var password = config["NaukriSettings:Password"];
+                var fromKey = config["NaukriSettings:FormKey"];
+
+                if (string.IsNullOrEmpty(email) || string.IsNullOrEmpty(password))
+                    throw new Exception("Email or Password missing in appsettings.json");
+
+                // 2. Login
+                Log.Information("[STEP 2/7] Logging in as {Email}...", email);
+                var authService = new AuthService();
+                var (client, _) = await authService.LoginAsync(email, password);
+                Log.Information("[STEP 2/7] Login successful ✅");
+
+                // 3. Get Profile ID
+                Log.Information("[STEP 3/7] Fetching profile ID...");
+                var profileId = await GetProfileId(client);
+                Log.Information("[STEP 3/7] Profile ID: {ProfileId} ✅", profileId);
+
+                // 4. Log dashboard metrics (views, search appearances, etc.)
+                Log.Information("[STEP 4/7] Fetching dashboard metrics...");
+                await LogDashboardMetrics(client);
+                await RandomDelay();
+
+                // 5. Run all profile update tasks
+                Log.Information("[STEP 5/7] Running profile update tasks...");
+
+                Log.Information("  → Task 1: Rotating Key Skills");
+                await RotateKeySkills(client, profileId);
+                await RandomDelay();
+
+                Log.Information("  → Task 2: Rotating Summary");
+                await RotateSummary(client, profileId);
+                await RandomDelay();
+
+                Log.Information("  → Task 3: Updating Resume Headline");
+                await UpdateResumeHeadline(client, profileId);
+                await RandomDelay();
+
+                // 6. Trigger activity (simulates user visiting profile)
+                Log.Information("[STEP 6/7] Triggering activity ping...");
+                await TriggerActivity(client);
+                await RandomDelay();
+
+
+
+                Log.Information("[STEP 7/7] Updating Resume...");
+
+                await UploadAndUpdateAsync(client, profileId, fromKey);
+                await RandomDelay();
+
+                Log.Information("========================================");
+                Log.Information("     Resume Updated!!!   ");
+                Log.Information("========================================");
+
+                Log.Information("========================================");
+                Log.Information("     ALL TASKS COMPLETED SUCCESSFULLY   ");
+                Log.Information("========================================");
+            }
+            catch (Exception ex)
+            {
+                Log.Error(ex, "❌ Error occurred in NaukriService");
+                throw;
+            }
+        }
+
+
+        // ─────────────────────────────────────────────
+        //  GET PROFILE ID
+        //  Calls dashboard API and extracts profileId
+        // ─────────────────────────────────────────────
+        private async Task<string> GetProfileId(HttpClient client)
+        {
+            var response = await client.GetAsync(
+                "https://www.naukri.com/cloudgateway-mynaukri/resman-aggregator-services/v0/users/self/dashboard");
+
+            if (!response.IsSuccessStatusCode)
+                throw new Exception($"Dashboard API failed with status: {response.StatusCode}");
+
+            var json = await response.Content.ReadAsStringAsync();
+
+            using var doc = JsonDocument.Parse(json);
+
+            return doc.RootElement
+                .GetProperty("dashBoard")
+                .GetProperty("profileId")
+                .GetString();
+        }
+
+
+        // ─────────────────────────────────────────────
+        //  GET FULL PROFILE
+        //  Returns entire profile as dynamic object
+        //  Usage: var p = await GetFullProfile(client);
+        //         var name = (string)p.profile[0].name;
+        // ─────────────────────────────────────────────
+        private async Task<dynamic> GetFullProfile(HttpClient client)
+        {
+            var request = new HttpRequestMessage(HttpMethod.Get,
+                "https://www.naukri.com/cloudgateway-mynaukri/resman-aggregator-services/v2/users/self?expand_level=4");
+
+            request.Headers.Add("appid", "105");
+            request.Headers.Add("clientid", "d3skt0p");
+            request.Headers.Add("systemid", "Naukri");
+            request.Headers.Add("x-requested-with", "XMLHttpRequest");
+            request.Headers.TryAddWithoutValidation("User-Agent",
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/147.0.0.0 Safari/537.36");
+            request.Headers.Add("Accept", "application/json");
+            request.Headers.Add("Referer", "https://www.naukri.com/mnjuser/profile");
+
+            var response = await client.SendAsync(request);
+            var body = await response.Content.ReadAsStringAsync();
+
+            if (!response.IsSuccessStatusCode)
+                throw new Exception($"GetFullProfile failed with status: {response.StatusCode}");
+
+            return JsonConvert.DeserializeObject(body);
+        }
+
+
+        // ─────────────────────────────────────────────
+        //  UPDATE RESUME HEADLINE
+        //  1. Fetches current headline
+        //  2. Applies minor synonym swaps (TweakHeadline)
+        //  3. Saves updated headline via fullprofiles API
+        // ─────────────────────────────────────────────
+        private async Task UpdateResumeHeadline(HttpClient client, string profileId)
+        {
+            Log.Information("     [Headline] Fetching current headline...");
+
+            dynamic fullProfile = await GetFullProfile(client);
+            string currentHeadline = (string)fullProfile.profile[0].resumeHeadline;
+            Log.Information("     [Headline] Current : {Headline}", currentHeadline);
+
+            string newHeadline = TweakHeadline(currentHeadline);
+            Log.Information("     [Headline] Updated : {Headline}", newHeadline);
+
+            var payload = new
+            {
+                profileId = profileId,
+                profile = new { resumeHeadline = newHeadline }
+            };
+
+            var request = new HttpRequestMessage(HttpMethod.Post,
+                "https://www.naukri.com/cloudgateway-mynaukri/resman-aggregator-services/v1/users/self/fullprofiles");
+
+            request.Headers.Add("appid", "105");
+            request.Headers.Add("clientid", "d3skt0p");
+            request.Headers.Add("systemid", "Naukri");
+            request.Headers.Add("x-requested-with", "XMLHttpRequest");
+            request.Headers.Add("x-http-method-override", "PUT");
+            request.Headers.TryAddWithoutValidation("User-Agent",
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/147.0.0.0 Safari/537.36");
+            request.Headers.Add("Accept", "application/json");
+            request.Headers.Add("Origin", "https://www.naukri.com");
+            request.Headers.Add("Referer", "https://www.naukri.com/mnjuser/profile?action=modalOpen");
+
+            request.Content = new StringContent(
+                JsonConvert.SerializeObject(payload), Encoding.UTF8, "application/json");
+
+            var response = await client.SendAsync(request);
+
+            if (!response.IsSuccessStatusCode)
+            {
+                var error = await response.Content.ReadAsStringAsync();
+                Log.Error("     [Headline] ❌ Failed. Status: {Status}, Body: {Body}", response.StatusCode, error);
+                throw new Exception("Headline update failed");
+            }
+
+            Log.Information("     [Headline] ✅ Updated successfully!");
+        }
+
+
+        // ─────────────────────────────────────────────
+        //  ROTATE KEY SKILLS
+        //  1. Fetches keySkills string e.g. "ASP.NET,C#,SQL"
+        //  2. Randomly shuffles the order
+        //  3. Saves shuffled skills via fullprofiles API
+        // ─────────────────────────────────────────────
+        private async Task RotateKeySkills(HttpClient client, string profileId)
+        {
+            Log.Information("     [KeySkills] Fetching current skills...");
+
+            dynamic fullProfile = await GetFullProfile(client);
+            string keySkillsRaw = (string)fullProfile.profile[0].keySkills;
+            Log.Information("     [KeySkills] Current : {Skills}", keySkillsRaw);
+
+            // Shuffle the comma-separated skills randomly
+            var rng = new Random();
+            var shuffled = keySkillsRaw
+                .Split(',')
+                .Select(s => s.Trim())
+                .OrderBy(_ => rng.Next())
+                .ToList();
+
+            var newKeySkills = string.Join(",", shuffled);
+            Log.Information("     [KeySkills] Shuffled: {Skills}", newKeySkills);
+
+            var payload = new
+            {
+                profileId = profileId,
+                profile = new { keySkills = newKeySkills }
+            };
+
+            var request = new HttpRequestMessage(HttpMethod.Post,
+                "https://www.naukri.com/cloudgateway-mynaukri/resman-aggregator-services/v1/users/self/fullprofiles");
+
+            request.Headers.Add("appid", "105");
+            request.Headers.Add("clientid", "d3skt0p");
+            request.Headers.Add("systemid", "Naukri");
+            request.Headers.Add("x-requested-with", "XMLHttpRequest");
+            request.Headers.Add("x-http-method-override", "PUT");
+            request.Headers.TryAddWithoutValidation("User-Agent",
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/147.0.0.0 Safari/537.36");
+            request.Headers.Add("Accept", "application/json");
+            request.Headers.Add("Origin", "https://www.naukri.com");
+            request.Headers.Add("Referer", "https://www.naukri.com/mnjuser/profile?action=modalOpen");
+
+            request.Content = new StringContent(
+                JsonConvert.SerializeObject(payload), Encoding.UTF8, "application/json");
+
+            var response = await client.SendAsync(request);
+            var body = await response.Content.ReadAsStringAsync();
+
+            if (!response.IsSuccessStatusCode)
+            {
+                Log.Error("     [KeySkills] ❌ Failed. Status: {Status}, Body: {Body}", response.StatusCode, body);
+                throw new Exception("KeySkills rotation failed");
+            }
+
+            Log.Information("     [KeySkills] ✅ Rotated successfully!");
+        }
+
+
+        // ─────────────────────────────────────────────
+        //  ROTATE SUMMARY
+        //  1. Fetches current summary
+        //  2. Applies minor synonym swaps (TweakSummary)
+        //  3. Saves updated summary via fullprofiles API
+        // ─────────────────────────────────────────────
+        private async Task RotateSummary(HttpClient client, string profileId)
+        {
+            Log.Information("     [Summary] Fetching current summary...");
+
+            dynamic fullProfile = await GetFullProfile(client);
+            string currentSummary = (string)fullProfile.profile[0].summary;
+            Log.Information("     [Summary] Current : {Summary}", currentSummary);
+
+            string newSummary = TweakSummary(currentSummary);
+            Log.Information("     [Summary] Updated : {Summary}", newSummary);
+
+            var payload = new
+            {
+                profileId = profileId,
+                profile = new { summary = newSummary }
+            };
+
+            var request = new HttpRequestMessage(HttpMethod.Post,
+                "https://www.naukri.com/cloudgateway-mynaukri/resman-aggregator-services/v1/users/self/fullprofiles");
+
+            request.Headers.Add("appid", "105");
+            request.Headers.Add("clientid", "d3skt0p");
+            request.Headers.Add("systemid", "Naukri");
+            request.Headers.Add("x-requested-with", "XMLHttpRequest");
+            request.Headers.Add("x-http-method-override", "PUT");
+            request.Headers.TryAddWithoutValidation("User-Agent",
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/147.0.0.0 Safari/537.36");
+            request.Headers.Add("Accept", "application/json");
+            request.Headers.Add("Origin", "https://www.naukri.com");
+            request.Headers.Add("Referer", "https://www.naukri.com/mnjuser/profile?action=modalOpen");
+
+            request.Content = new StringContent(
+                JsonConvert.SerializeObject(payload), Encoding.UTF8, "application/json");
+
+            var response = await client.SendAsync(request);
+
+            if (!response.IsSuccessStatusCode)
+            {
+                var error = await response.Content.ReadAsStringAsync();
+                Log.Error("     [Summary] ❌ Failed. Status: {Status}, Body: {Body}", response.StatusCode, error);
+                throw new Exception("Summary update failed");
+            }
+
+            Log.Information("     [Summary] ✅ Updated successfully!");
+        }
+
+
+        // ─────────────────────────────────────────────
+        //  TWEAK SUMMARY
+        //  Swaps 1-2 phrases with synonyms
+        //  Pairs are reversible so it alternates each run
+        //  e.g. "around 3 years" ↔ "approximately 3 years"
+        // ─────────────────────────────────────────────
+        private string TweakSummary(string original)
+        {
+            var rng = new Random();
+
+            var swaps = new List<(string from, string to)>
+            {
+                ("around 3 years",                          "approximately 3 years"),
+                ("approximately 3 years",                   "around 3 years"),
+                ("application support",                     "production support"),
+                ("production support",                      "application support"),
+                ("system enhancement",                      "system improvement"),
+                ("system improvement",                      "system enhancement"),
+                ("resolving production issues",             "fixing production issues"),
+                ("fixing production issues",                "resolving production issues"),
+                ("Focused on",                              "Committed to"),
+                ("Committed to",                            "Focused on"),
+                ("stable, maintainable",                    "maintainable, stable"),
+                ("maintainable, stable",                    "stable, maintainable"),
+                ("scalable backend solutions",              "scalable and reliable backend solutions"),
+                ("scalable and reliable backend solutions", "scalable backend solutions"),
+                ("participating in",                        "involved in"),
+                ("involved in",                             "participating in"),
+                ("proper design patterns",                  "industry-standard design patterns"),
+                ("industry-standard design patterns",       "proper design patterns"),
+                ("Web API,MVC",                             "Web API, MVC"),
+                ("Web API, MVC",                            "Web API,MVC"),
+            };
+
+            var applicable = swaps
+                .Where(s => original.Contains(s.from))
+                .OrderBy(_ => rng.Next())
+                .Take(rng.Next(1, 3))
+                .ToList();
+
+            string result = original;
+            foreach (var (from, to) in applicable)
+            {
+                result = result.Replace(from, to);
+                Log.Information("     [Summary] Swap: '{From}' → '{To}'", from, to);
+            }
+
+            return result;
+        }
+
+
+        // ─────────────────────────────────────────────
+        //  TWEAK HEADLINE
+        //  Same approach as TweakSummary
+        //  Swaps 1-2 phrases with synonyms per run
+        // ─────────────────────────────────────────────
+        private string TweakHeadline(string original)
+        {
+            var rng = new Random();
+
+            var swaps = new List<(string from, string to)>
+            {
+                ("Results-oriented",                     "Result-driven"),
+                ("Result-driven",                        "Results-oriented"),
+                ("extensive experience",                 "strong experience"),
+                ("strong experience",                    "extensive experience"),
+                ("Proven track record",                  "Demonstrated track record"),
+                ("Demonstrated track record",            "Proven track record"),
+                ("designing and developing",             "developing and designing"),
+                ("developing and designing",             "designing and developing"),
+                ("scalable web applications",            "scalable and robust web applications"),
+                ("scalable and robust web applications", "scalable web applications"),
+                ("implementing database integration",    "handling database integration"),
+                ("handling database integration",        "implementing database integration"),
+                ("delivering high-quality code",         "writing high-quality code"),
+                ("writing high-quality code",            "delivering high-quality code"),
+                ("ASP.NET, C#, and MVC",                "C#, ASP.NET, and MVC"),
+                ("C#, ASP.NET, and MVC",                "ASP.NET, C#, and MVC"),
+            };
+
+            var applicable = swaps
+                .Where(s => original.Contains(s.from))
+                .OrderBy(_ => rng.Next())
+                .Take(rng.Next(1, 3))
+                .ToList();
+
+            string result = original;
+            foreach (var (from, to) in applicable)
+            {
+                result = result.Replace(from, to);
+                Log.Information("     [Headline] Swap: '{From}' → '{To}'", from, to);
+            }
+
+            return result;
+        }
+
+
+        // ─────────────────────────────────────────────
+        //  LOG DASHBOARD METRICS
+        //  Reads and logs key profile stats:
+        //  - Profile views
+        //  - Search appearances
+        //  - Last recruiter action date
+        //  - Profile completeness (PC score)
+        //  - Last modified timestamp
+        //  Also saves to metrics.csv for trend tracking
+        // ─────────────────────────────────────────────
+        private async Task LogDashboardMetrics(HttpClient client)
+        {
+            var response = await client.GetAsync(
+                "https://www.naukri.com/cloudgateway-mynaukri/resman-aggregator-services/v0/users/self/dashboard");
+
+            var body = await response.Content.ReadAsStringAsync();
+            dynamic dashboard = JsonConvert.DeserializeObject(body);
+
+            var profileViews = (int)dashboard.dashBoard.profileViewCount;
+            var searchAppearances = (int)dashboard.dashBoard.totalSearchAppearancesCount;
+            var recruiterDate = (string)dashboard.dashBoard.recruiterActionsLatestDate;
+            var completeness = (int)dashboard.dashBoard.pc;
+            var lastModified = (string)dashboard.dashBoard.mod_dt;
+            var stale = (int)dashboard.dashBoard.modDtGtThanSixMonths;
+
+            Log.Information("┌─────────────────────────────────┐");
+            Log.Information("│        PROFILE METRICS          │");
+            Log.Information("├─────────────────────────────────┤");
+            Log.Information("│ Profile Views        : {Views}", profileViews);
+            Log.Information("│ Search Appearances   : {Count}", searchAppearances);
+            Log.Information("│ Last Recruiter Action: {Date}", recruiterDate);
+            Log.Information("│ Completeness (PC)    : {PC}%", completeness);
+            Log.Information("│ Last Modified        : {ModDt}", lastModified);
+            Log.Information("│ Stale (>6 months)    : {Stale}", stale == 1 ? "YES ⚠️" : "No ✅");
+            Log.Information("└─────────────────────────────────┘");
+
+            if (completeness < 100)
+                Log.Warning("⚠️  Profile completeness is {PC}% — some sections are incomplete!", completeness);
+
+            if (stale == 1)
+                Log.Warning("⚠️  Profile has not been updated in 6+ months!");
+
+            // Append one line per run to metrics.csv for trend tracking
+            // Format: date, views, searchAppearances, lastRecruiterAction, completeness
+            var entry = $"{DateTime.Now:yyyy-MM-dd},{profileViews},{searchAppearances},{recruiterDate},{completeness}\n";
+            await File.AppendAllTextAsync("metrics.csv", entry);
+            Log.Information("     [Metrics] Saved to metrics.csv ✅");
+        }
+
+
+
+
+        // ─────────────────────────────────────────────
+        //  UPDATES RESUME
+        // ─────────────────────────────────────────────
+        public async Task UploadAndUpdateAsync(HttpClient client, string profileId, string formKey)
+        {
+            try
+            {
+                Log.Information("Starting resume upload process...");
+
+                string resumeFolder = Path.Combine(AppContext.BaseDirectory, "Resume");
+                Log.Information("Looking for resume in folder: {Folder}", resumeFolder);
+
+                var filePath = Directory.GetFiles(resumeFolder, "*.pdf").FirstOrDefault();
+
+                if (filePath == null)
+                {
+                    Log.Error("No resume file found in Resume folder");
+                    throw new Exception("No resume found in Resume folder");
+                }
+
+                Log.Information("Resume found: {FileName}", Path.GetFileName(filePath));
+
+                byte[] fileBytes = await File.ReadAllBytesAsync(filePath);
+                Log.Information("Resume file read successfully. Size: {Size} bytes", fileBytes.Length);
+
+                string fileKey = "U" + Guid.NewGuid().ToString("N").Substring(0, 13);
+
+                var multipart = new MultipartFormDataContent();
+                var fileContent = new ByteArrayContent(fileBytes);
+                fileContent.Headers.ContentType = new MediaTypeHeaderValue("application/pdf");
+
+                multipart.Add(fileContent, "file", "SumitRaghuvanshiResume1.pdf");
+                multipart.Add(new StringContent(formKey), "formKey");
+                multipart.Add(new StringContent("SumitRaghuvanshiResume1.pdf"), "fileName");
+                multipart.Add(new StringContent("true"), "uploadCallback");
+                multipart.Add(new StringContent(fileKey), "fileKey");
+
+                Log.Information("Uploading resume to server...");
+
+                var uploadResponse = await client.PostAsync("https://filevalidation.naukri.com/file", multipart);
+
+                Log.Information("Upload response status: {StatusCode}", uploadResponse.StatusCode);
+
+                if (!uploadResponse.IsSuccessStatusCode)
+                {
+                    Log.Error("Resume upload failed");
+                    throw new Exception("Upload failed");
+                }
+
+                Log.Information("Resume uploaded successfully");
+
+                var updatePayload = new
+                {
+                    textCV = new
+                    {
+                        formKey = formKey,
+                        fileKey = fileKey,
+                        textCvContent = (string)null
+                    }
+                };
+
+                var request = new HttpRequestMessage(HttpMethod.Post,
+                    $"https://www.naukri.com/cloudgateway-mynaukri/resman-aggregator-services/v0/users/self/profiles/{profileId}/advResume");
+
+                request.Content = new StringContent(JsonConvert.SerializeObject(updatePayload), Encoding.UTF8, "application/json");
+                request.Headers.Add("x-http-method-override", "PUT");
+
+                Log.Information("Updating resume in profile...");
+
+                var updateResponse = await client.SendAsync(request);
+
+                Log.Information("Update response status: {StatusCode}", updateResponse.StatusCode);
+
+                if (!updateResponse.IsSuccessStatusCode)
+                {
+                    Log.Error("Resume update failed");
+                    throw new Exception("Update failed");
+                }
+
+                Log.Information("Resume updated successfully 🎉");
+            }
+            catch (Exception ex)
+            {
+                Log.Error(ex, "Error occurred in ResumeService");
+                throw;
+            }
+        }
+
+
+        // ─────────────────────────────────────────────
+        //  TRIGGER ACTIVITY
+        //  Hits dashboard + profile page endpoints
+        //  Simulates a real user visiting their profile
+        //  Keeps the account marked as "active"
+        // ─────────────────────────────────────────────
+        private async Task TriggerActivity(HttpClient client)
+        {
+            await client.GetAsync(
+                "https://www.naukri.com/cloudgateway-mynaukri/resman-aggregator-services/v0/users/self/dashboard");
+            await RandomDelay();
+            await client.GetAsync("https://www.naukri.com/mnjuser/profile");
+
+            Log.Information("     [Activity]  Activity ping sent");
+        }
+
+
+        // ─────────────────────────────────────────────
+        //  RANDOM DELAY
+        //  Waits 3–8 seconds between API calls
+        //  Makes request pattern look more human
+        // ─────────────────────────────────────────────
+        private async Task RandomDelay()
+        {
+            var rng = new Random();
+            var seconds = rng.Next(3, 9);
+            Log.Information("     [Delay] Waiting {Seconds}s...", seconds);
+            await Task.Delay(TimeSpan.FromSeconds(seconds));
+        }
+    }
+}

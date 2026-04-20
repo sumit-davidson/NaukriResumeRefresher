@@ -1,14 +1,24 @@
-﻿using System.Net;
+﻿using Microsoft.Extensions.Options;
+using NaukriResumeRefresher.Interfaces;
+using NaukriResumeRefresher.Models;
+using Serilog;
+using System.Net;
 using System.Net.Http.Headers;
 using System.Text;
 using System.Text.Json;
-using Serilog;
 
 namespace NaukriResumeRefresher.Services
 {
-    public class AuthService
+    public class AuthService : IAuthService
     {
-        public async Task<(HttpClient client, string token)> LoginAsync(string email, string password)
+        private readonly NaukriSettings _settings;
+
+        public AuthService(IOptions<NaukriSettings> options)
+        {
+            _settings = options.Value;
+        }
+
+        public async Task<HttpClient> LoginAsync()
         {
             Log.Information("Starting login process...");
 
@@ -18,14 +28,13 @@ namespace NaukriResumeRefresher.Services
                 CookieContainer = new CookieContainer()
             };
 
+            // Note: We use handler directly here because we need
+            // cookie container access after the request
             var client = new HttpClient(handler);
 
-            client.DefaultRequestHeaders.Add("appid", "105");
-            client.DefaultRequestHeaders.Add("clientid", "d3skt0p");
-            client.DefaultRequestHeaders.Add("systemid", "jobseeker");
-            client.DefaultRequestHeaders.Add("x-requested-with", "XMLHttpRequest");
+            SetDefaultHeaders(client);
 
-            var payload = new { username = email, password = password };
+            var payload = new { username = _settings.Email, password = _settings.Password };
 
             try
             {
@@ -40,7 +49,8 @@ namespace NaukriResumeRefresher.Services
 
                 if (!response.IsSuccessStatusCode)
                 {
-                    Log.Error("Login failed with status code: {StatusCode}", response.StatusCode);
+                    var errorBody = await response.Content.ReadAsStringAsync();
+                    Log.Error("Login failed. Status: {StatusCode}, Body: {Body}", response.StatusCode, errorBody);
                     throw new Exception("Login failed");
                 }
 
@@ -55,18 +65,40 @@ namespace NaukriResumeRefresher.Services
                     throw new Exception("Token missing");
                 }
 
-                Log.Information("Token acquired successfully");
-
                 client.DefaultRequestHeaders.Authorization =
                     new AuthenticationHeaderValue("Bearer", token);
 
-                return (client, token);
+                Log.Information("Token acquired and set successfully ✅");
+
+                return client;
             }
             catch (Exception ex)
             {
                 Log.Error(ex, "Exception occurred during login process");
                 throw;
             }
+        }
+
+        private void SetDefaultHeaders(HttpClient client)
+        {
+            client.DefaultRequestHeaders.Add("appid", "105");
+            client.DefaultRequestHeaders.Add("clientid", "d3skt0p");
+            client.DefaultRequestHeaders.Add("systemid", "jobseeker");
+            client.DefaultRequestHeaders.Add("x-requested-with", "XMLHttpRequest");
+            client.DefaultRequestHeaders.TryAddWithoutValidation("User-Agent",
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/147.0.0.0 Safari/537.36");
+            client.DefaultRequestHeaders.Add("Accept", "application/json, text/plain, */*");
+            client.DefaultRequestHeaders.Add("Accept-Language", "en-US,en;q=0.8");
+            client.DefaultRequestHeaders.TryAddWithoutValidation("sec-ch-ua",
+                "\"Brave\";v=\"147\", \"Not.A/Brand\";v=\"8\", \"Chromium\";v=\"147\"");
+            client.DefaultRequestHeaders.Add("sec-ch-ua-mobile", "?0");
+            client.DefaultRequestHeaders.Add("sec-ch-ua-platform", "\"Windows\"");
+            client.DefaultRequestHeaders.Add("sec-fetch-dest", "empty");
+            client.DefaultRequestHeaders.Add("sec-fetch-mode", "cors");
+            client.DefaultRequestHeaders.Add("sec-fetch-site", "same-origin");
+            client.DefaultRequestHeaders.Add("sec-gpc", "1");
+            client.DefaultRequestHeaders.Add("Origin", "https://www.naukri.com");
+            client.DefaultRequestHeaders.Add("Referer", "https://www.naukri.com/");
         }
     }
 }

@@ -1,8 +1,25 @@
-﻿
-*.log
+﻿# Credentials and personal config
+appsettings.json
+
+# Resume folder (personal file)
+Resume/
+
+# Logs and metrics (generated at runtime)
+Logs/
+metrics.csv
+
+# Build output
 bin/
 obj/
-node_modules/
 
-secrets/*
-!secrets/keep-this.txt
+# Visual Studio files
+.vs/
+*.user
+*.suo
+
+# Rider IDE
+.idea/
+
+# OS files
+.DS_Store
+Thumbs.db
